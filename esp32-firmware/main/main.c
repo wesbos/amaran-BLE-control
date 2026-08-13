@@ -48,9 +48,14 @@ static const char *TAG = "amaran_node";
 #define UART_NUM UART_NUM_0
 #define UART_BUF_SIZE 256
 
-/* This node's unicast address. Existing fixtures are at 2/4/6; pick
- * something well outside that range. */
-#define ESP32_UNICAST_ADDR 0x0010
+/* This node's unicast address. The amaran app assigns fixture addresses
+ * upward from low values (a seven-fixture rig was observed holding
+ * 0x000c–0x001c), so a low value here can silently collide with a real
+ * fixture. The symptom is subtle: the colliding fixture never answers a
+ * status request, because this node answers for its address. 0x00f0 leaves
+ * generous headroom. If you change this on an already-provisioned board,
+ * run `idf.py erase-flash` — the old address persists in NVS. */
+#define ESP32_UNICAST_ADDR 0x00f0
 #define APP_KEY_INDEX      0x0000
 #define NET_KEY_INDEX      0x0000
 #define DEFAULT_TTL        7
