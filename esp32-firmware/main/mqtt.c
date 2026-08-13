@@ -42,6 +42,18 @@ typedef struct {
     int gm;               /* -50..+50, 0 = neutral */
     bool is_hs;           /* true: last set was color (hs); false: CCT */
     bool dirty;           /* needs a debounced state publish */
+    /* On/off verify-and-retry. Mesh sends are fire-and-forget; a lost
+     * on/off PDU leaves the fixture contradicting what we told HA, and the
+     * post-command refresh then "corrects" HA back to the stale state (the
+     * light stays on after an off, and HA flips back to "on" ~1s later).
+     * Track the last commanded on/off so a status reply that contradicts a
+     * fresh command triggers a bounded re-send instead of being adopted as
+     * an external change. */
+    bool cmd_pending;        /* an on/off command awaits status confirmation */
+    bool cmd_on;             /* the on/off state we commanded */
+    int64_t cmd_deadline_us; /* esp_timer time after which we stop retrying */
+    int cmd_retries_left;
+    bool retry_due;          /* set in mesh-rx context, consumed by timer */
 } fixture_state_t;
 static fixture_state_t s_state[AMARAN_LIGHT_COUNT];
 
@@ -104,6 +116,30 @@ static void schedule_publish(int idx)
     if (!s_publish_timer) return;
     esp_timer_stop(s_publish_timer);
     esp_timer_start_once(s_publish_timer, PUBLISH_DEBOUNCE_US);
+}
+
+/* On/off verify-and-retry, send side. amaran_mqtt_report_state() runs in
+ * the BLE mesh rx path, so it must not send mesh messages itself; it marks
+ * the fixture retry_due and arms this one-shot timer. Mesh sends from the
+ * esp_timer task are already the established pattern (refresh_timer_cb in
+ * main.c does the same). Each re-send goes through the on_off dispatch,
+ * whose schedule_refresh() fetches a fresh status ~600ms later — closing
+ * the verify loop. */
+static esp_timer_handle_t s_retry_timer;
+#define CMD_RETRY_DELAY_US   100000              /* 100ms breather */
+#define CMD_VERIFY_WINDOW_US (5 * 1000 * 1000)   /* give up after 5s */
+#define CMD_RETRIES          2
+
+static void retry_timer_cb(void *arg)
+{
+    for (int i = 0; i < AMARAN_LIGHT_COUNT; i++) {
+        fixture_state_t *st = &s_state[i];
+        if (!st->retry_due) continue;
+        st->retry_due = false;
+        ESP_LOGW(TAG, "on/off for %s not confirmed — resending on=%d (%d left)",
+                 AMARAN_LIGHTS[i].key, st->cmd_on, st->cmd_retries_left);
+        s_dispatch->on_off(AMARAN_LIGHTS[i].address, st->cmd_on);
+    }
 }
 
 /* Publish one HA MQTT-discovery message per fixture. */
@@ -243,6 +279,12 @@ static void handle_command_for(int idx, const char *payload, int len)
     if (wants_on != s_state[idx].on) {
         s_dispatch->on_off(dst, wants_on);
         s_state[idx].on = wants_on;
+        /* Arm verify-and-retry — see amaran_mqtt_report_state(). */
+        s_state[idx].cmd_pending = true;
+        s_state[idx].cmd_on = wants_on;
+        s_state[idx].cmd_deadline_us = esp_timer_get_time()
+                                       + CMD_VERIFY_WINDOW_US;
+        s_state[idx].cmd_retries_left = CMD_RETRIES;
     }
 
     if (wants_on) {
@@ -326,6 +368,29 @@ void amaran_mqtt_report_state(uint16_t addr, bool on, bool is_hs,
     }
     fixture_state_t *st = &s_state[i];
     bool changed = false;
+
+    /* On/off verify-and-retry, receive side. If this status contradicts an
+     * on/off we commanded within the last few seconds, the mesh PDU was
+     * lost — re-send the command instead of adopting the stale state. Once
+     * retries are exhausted or the window passes, fall through and adopt:
+     * genuine external changes (phone app, physical knob) still flow to HA
+     * as before. */
+    if (st->cmd_pending) {
+        if (on == st->cmd_on) {
+            st->cmd_pending = false;             /* confirmed — all good */
+        } else if (st->cmd_retries_left > 0 &&
+                   esp_timer_get_time() < st->cmd_deadline_us) {
+            st->cmd_retries_left--;
+            st->retry_due = true;
+            if (s_retry_timer) {
+                esp_timer_stop(s_retry_timer);
+                esp_timer_start_once(s_retry_timer, CMD_RETRY_DELAY_US);
+            }
+            return;                              /* don't adopt; retry */
+        } else {
+            st->cmd_pending = false;             /* give up; adopt truth */
+        }
+    }
 
     /* Thresholds suppress the echo of our own commands (the fixture reads
      * back ~exactly what we set) while still catching genuine external
@@ -453,6 +518,12 @@ int amaran_mqtt_start(const amaran_mqtt_dispatch_t *dispatch)
         .name = "amaran_mqtt_pub",
     };
     esp_timer_create(&pub_args, &s_publish_timer);
+
+    const esp_timer_create_args_t retry_args = {
+        .callback = retry_timer_cb,
+        .name = "amaran_mqtt_retry",
+    };
+    esp_timer_create(&retry_args, &s_retry_timer);
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_URI,
