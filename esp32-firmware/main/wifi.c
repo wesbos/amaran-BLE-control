@@ -62,6 +62,18 @@ int amaran_wifi_start(amaran_wifi_got_ip_cb_t got_ip_cb)
             sizeof(wifi_cfg.sta.password) - 1);
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
+    /* The zero-initialized default is WIFI_FAST_SCAN, which associates to the
+     * first SSID match in channel order and never compares signal strength.
+     * On a network where several APs broadcast the same SSID, that
+     * deterministically picks whichever AP sits on the lowest-numbered
+     * channel — possibly a distant one — even with a strong AP in the same
+     * room. Scan all channels and pick by RSSI instead; costs a few hundred
+     * ms once at connect, and matters here because the bridge holds a
+     * persistent MQTT connection whose quality degrades invisibly on a
+     * marginal link (entities flap unavailable rather than failing clean). */
+    wifi_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
