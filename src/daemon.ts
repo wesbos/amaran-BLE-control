@@ -324,7 +324,14 @@ async function runDaemon() {
     try {
       // GET / or GET /lights — list lights / health check
       if (method === "GET" && (url === "/" || url === "/lights")) {
-        jsonResponse(res, 200, { ok: true, lights: ctrl.lights, daemon: true });
+        jsonResponse(res, 200, { ok: true, lights: ctrl.lights, daemon: true, connected: ctrl.connected });
+        return;
+      }
+
+      // Writes are fire-and-forget, so a 200 with the link down would be a
+      // lie. Say so instead and let the caller decide what to do.
+      if (method === "POST" && url.startsWith("/lights") && !ctrl.connected) {
+        jsonResponse(res, 503, { ok: false, error: "BLE mesh link down" });
         return;
       }
 
