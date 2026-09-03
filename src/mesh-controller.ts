@@ -333,6 +333,16 @@ function parseIVIndexFromProxy(data: Buffer): number | null {
 
 export class MeshController {
   private peripheral: any = null;
+
+  // Whether the BLE proxy link is believed to be up. Set on a successful
+  // connect, cleared by the disconnect handler in doConnect(). Reads as false
+  // until the proxy characteristics exist, since a peripheral without them
+  // cannot carry mesh traffic.
+  private connectedFlag = false;
+
+  get connected(): boolean {
+    return this.connectedFlag && !!this.dataIn && !!this.dataOut;
+  }
   private dataIn: any = null;
   private dataOut: any = null;
   private ivIndex = 0;
@@ -438,6 +448,30 @@ export class MeshController {
           await p.connectAsync();
           self.peripheral = p;
 
+          // noble emits this when the light drops the link — after a power
+          // cycle, going out of range, or using its onboard knobs. Nothing
+          // listened for it before, so the controller went on writing into a
+          // dead handle indefinitely.
+          p.once("disconnect", () => {
+            console.log("BLE link dropped — marking mesh unavailable");
+            self.connectedFlag = false;
+            self.dataIn = null;
+            self.dataOut = null;
+            self.peripheral = null;
+
+            // Reconnecting in-process is not safe here: connect() registers
+            // fresh noble.on("discover") listeners on every call, so
+            // re-entering it accumulates handlers. Under a supervisor
+            // (launchd KeepAlive, systemd Restart=) exiting is the clean
+            // recovery — a daemon that cannot reach the mesh is of no use
+            // alive, and a fresh process gets a fresh connection. Opt-in so
+            // interactive use is unaffected.
+            if (process.env.AMARAN_EXIT_ON_DISCONNECT === "1") {
+              console.error("Exiting so the supervisor can restart with a fresh link");
+              process.exit(1);
+            }
+          });
+
           const { characteristics } = await p.discoverSomeServicesAndCharacteristicsAsync(
             [PROXY_SERVICE], [PROXY_DATA_IN, PROXY_DATA_OUT]
           );
@@ -454,6 +488,7 @@ export class MeshController {
 
           self.dataOut.on("data", (d: Buffer) => self.onNotify(d));
           await self.dataOut.subscribeAsync();
+          self.connectedFlag = true;
           console.log(`Connected to ${p.advertisement.localName || addr}`);
           return true;
         } catch (err) {
