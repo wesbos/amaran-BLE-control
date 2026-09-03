@@ -458,6 +458,18 @@ export class MeshController {
             self.dataIn = null;
             self.dataOut = null;
             self.peripheral = null;
+
+            // Reconnecting in-process is not safe here: connect() registers
+            // fresh noble.on("discover") listeners on every call, so
+            // re-entering it accumulates handlers. Under a supervisor
+            // (launchd KeepAlive, systemd Restart=) exiting is the clean
+            // recovery — a daemon that cannot reach the mesh is of no use
+            // alive, and a fresh process gets a fresh connection. Opt-in so
+            // interactive use is unaffected.
+            if (process.env.AMARAN_EXIT_ON_DISCONNECT === "1") {
+              console.error("Exiting so the supervisor can restart with a fresh link");
+              process.exit(1);
+            }
           });
 
           const { characteristics } = await p.discoverSomeServicesAndCharacteristicsAsync(
